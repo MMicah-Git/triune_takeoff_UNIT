@@ -22,7 +22,7 @@ from openpyxl.utils import get_column_letter
 # ---------------------------
 # App constants
 # ---------------------------
-APP_TITLE = "Triune Takeoff — Manual ordering (textarea only)"
+APP_TITLE = "Triune Takeoff"
 
 TRIUNE_COLUMNS = [
     "PRODUCT", "BRAND", "MODEL", "QTY", "TAG",
