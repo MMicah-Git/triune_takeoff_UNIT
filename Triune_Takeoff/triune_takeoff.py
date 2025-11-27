@@ -1,10 +1,9 @@
-# triune_takeoff_apply_buttons_working.py
-# Triune Takeoff — Product & Per-product TAG editors use explicit "Apply" buttons.
-# Updated fixes: robust AgGrid return mode, store original+normalized orders, rerun after apply, debug output.
+# triune_takeoff_apply_buttons_final.py
+# Triune Takeoff — Apply buttons with textarea fallbacks and safe rerun.
 # Run:
 #   python -m pip install streamlit pandas openpyxl
-#   python -m pip install streamlit-aggrid   # recommended
-#   streamlit run triune_takeoff_apply_buttons_working.py
+#   python -m pip install streamlit-aggrid   # optional for drag-and-drop
+#   streamlit run triune_takeoff_apply_buttons_final.py
 
 import io
 import re
@@ -19,7 +18,7 @@ import streamlit as st
 
 # optional ag-grid
 try:
-    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, DataReturnMode as DRM, DataReturnMode
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
     HAS_AGGRID = True
 except Exception:
     HAS_AGGRID = False
@@ -31,7 +30,7 @@ from openpyxl.utils import get_column_letter
 # ---------------------------
 # App constants
 # ---------------------------
-APP_TITLE = "Triune Takeoff — Apply buttons for editors (robust)"
+APP_TITLE = "Triune Takeoff — Apply buttons (final)"
 
 TRIUNE_COLUMNS = [
     "PRODUCT", "BRAND", "MODEL", "QTY", "TAG",
@@ -362,12 +361,34 @@ def export_styled_excel_bytes(df: pd.DataFrame) -> bytes:
     return bytes_from_df_excel(df)
 
 # ---------------------------
-# Editors with Apply buttons
+# Helpers to safely rerun (compatibility)
+# ---------------------------
+def safe_rerun():
+    """
+    Attempt to trigger a rerun in Streamlit. Some Streamlit builds may not expose
+    st.experimental_rerun; this wrapper swallows the AttributeError (no-op).
+    """
+    try:
+        rerun_fn = getattr(st, "experimental_rerun", None)
+        if callable(rerun_fn):
+            rerun_fn()
+            return
+        # best-effort attempt: raise RerunException if available (older/newer internals)
+        try:
+            from streamlit.runtime.scriptrunner import RerunException
+            raise RerunException()
+        except Exception:
+            return
+    except Exception:
+        return
+
+# ---------------------------
+# Editors with Apply buttons (final, no illegal session_state writes)
 # ---------------------------
 def render_dragdrop_product_editor_managed(preview_df: pd.DataFrame):
     """
-    Shows product editor. DOES NOT auto-save.
-    User must click 'Apply product order' to persist the manual order to session_state.
+    Shows product editor with AG Grid or textarea fallback.
+    DO NOT assign to a session_state key after creating a widget with that same key.
     """
     product_values = preview_df["PRODUCT"].fillna("").astype(str).tolist()
     seen = set()
@@ -400,7 +421,6 @@ def render_dragdrop_product_editor_managed(preview_df: pd.DataFrame):
             gridOptions["getRowNodeId"] = "function(data) { return data._row_id; }"
             gridOptions["suppressMovableColumns"] = True
 
-            # important: use AS_INPUT so the grid returns the exact user-ordered rows
             grid_response = AgGrid(
                 grid_df,
                 gridOptions=gridOptions,
@@ -412,7 +432,6 @@ def render_dragdrop_product_editor_managed(preview_df: pd.DataFrame):
 
             resp = None
             if isinstance(grid_response, dict):
-                # support different return payload shapes
                 resp = grid_response.get("data") or grid_response.get("rowData") or grid_response.get("gridData") or grid_response.get("selected_rows") or grid_response.get("returnedData")
             else:
                 resp = grid_response
@@ -463,9 +482,16 @@ def render_dragdrop_product_editor_managed(preview_df: pd.DataFrame):
             if not rows:
                 rows = grid_df.to_dict("records")
         else:
-            # fallback: show informational message instead of a newline-edit textarea
-            st.info("AG Grid not available — install streamlit-aggrid to enable drag-and-drop product ordering.")
-            rows = grid_df.to_dict("records")
+            # fallback textarea editable list (one product per line)
+            st.info("AG Grid not available — use the text box below to change product order (one product per line).")
+            fallback_key = "manual_order_fallback"
+            default_text = "\n".join(products)
+            pasted = st.text_area("Manual product order (one product per line):",
+                                  value=st.session_state.get(fallback_key, default_text),
+                                  height=200, key=fallback_key)
+            # use the returned value directly; don't assign to st.session_state[fallback_key] after widget creation
+            lines = [ln.strip() for ln in pasted.splitlines() if ln.strip() != ""]
+            rows = [{"PRODUCT": ln, "INCLUDE": True} for ln in lines] if lines else grid_df.to_dict("records")
 
         # Show current preview order (not saved yet)
         preview_order = [r.get("PRODUCT") for r in rows if (isinstance(r, dict) and bool(r.get("INCLUDE", True)))]
@@ -498,30 +524,20 @@ def render_dragdrop_product_editor_managed(preview_df: pd.DataFrame):
 
         if st.button("Apply product order"):
             if manual_list_norm:
-                # store both: normalized (for internal matching) and original (for display/debug)
                 st.session_state['triune_manual_products'] = manual_list_norm
                 st.session_state['triune_manual_products_original'] = manual_list_orig
                 st.session_state['product_grid_snapshot'] = rows
                 st.success(f"Product order applied — {len(manual_list_norm)} products saved.")
-                # ensure pipeline uses the new state immediately
-                st.experimental_rerun()
+                safe_rerun()
             else:
                 st.session_state.pop('triune_manual_products', None)
                 st.session_state.pop('triune_manual_products_original', None)
                 st.info("Cleared manual product order (nothing saved).")
 
-        # debug display (temporary)
-        if st.session_state.get('triune_manual_products_original') or st.session_state.get('triune_manual_products'):
-            st.caption("**DEBUG: saved product order**")
-            st.write("Normalized saved order:", st.session_state.get('triune_manual_products'))
-            st.write("Original saved order:", st.session_state.get('triune_manual_products_original'))
-
-
 def render_per_product_tag_editor(preview_df: pd.DataFrame):
     """
     Shows per-product tag editor with explicit Apply button to save per-product tag order.
-    Fallback newline-separated textarea has been removed. If AG Grid is not available,
-    the editor will show an informational message and use the detected tag order as-is.
+    Textarea fallback used when AG Grid not present.
     """
     detected_products = preview_df["PRODUCT"].fillna("").astype(str).tolist()
     seen = set(); prod_list = []
@@ -607,9 +623,15 @@ def render_per_product_tag_editor(preview_df: pd.DataFrame):
             if not rows:
                 rows = grid_df.to_dict("records")
         else:
-            # Removed the newline-separated textarea fallback — show info and keep original detected order
-            st.info("AG Grid not available — install streamlit-aggrid to enable drag-and-drop TAG ordering.")
-            rows = grid_df.to_dict("records")
+            # fallback textarea for tags (one tag per line)
+            st.info("AG Grid not available — use the text box below to change tag order for this product (one tag per line).")
+            fallback_key = f"manual_tag_order_{_norm_key(sel_prod)}"
+            default_text = "\n".join(tags)
+            pasted = st.text_area("Manual tag order for this product (one tag per line):",
+                                  value=st.session_state.get(fallback_key, default_text),
+                                  height=180, key=fallback_key)
+            lines = [ln.strip() for ln in pasted.splitlines() if ln.strip() != ""]
+            rows = [{"TAG": ln, "INCLUDE": True} for ln in lines] if lines else grid_df.to_dict("records")
 
         preview_order = [r.get("TAG") for r in rows if (isinstance(r, dict) and bool(r.get("INCLUDE", True)))]
         st.markdown("**Preview (unsaved) tag order for product:**")
@@ -642,20 +664,13 @@ def render_per_product_tag_editor(preview_df: pd.DataFrame):
                 st.session_state['triune_manual_tags_by_product_orig'][sel_prod_norm] = manual_orig_list
                 st.session_state['triune_perprod_tag_snapshot'] = st.session_state['triune_manual_tags_by_product']
                 st.success(f"Saved manual TAG order for product: {sel_prod} ({len(manual_norm_list)} tags).")
-                st.experimental_rerun()
+                safe_rerun()
             else:
-                # clear per-product manual order if nothing provided
                 if sel_prod_norm in st.session_state.get('triune_manual_tags_by_product', {}):
                     del st.session_state['triune_manual_tags_by_product'][sel_prod_norm]
                 if sel_prod_norm in st.session_state.get('triune_manual_tags_by_product_orig', {}):
                     del st.session_state['triune_manual_tags_by_product_orig'][sel_prod_norm]
                 st.info(f"Cleared manual TAG order for product: {sel_prod} (nothing saved).")
-
-        # debug display (temporary)
-        if st.session_state.get('triune_manual_tags_by_product'):
-            st.caption("**DEBUG: saved per-product tag orders (normalized keys)**")
-            st.write("Normalized (by product):", st.session_state.get('triune_manual_tags_by_product'))
-            st.write("Original (by product):", st.session_state.get('triune_manual_tags_by_product_orig'))
 
 # ---------------------------
 # Ordering helpers & pipeline (unchanged logic)
