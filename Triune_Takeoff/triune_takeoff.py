@@ -1,10 +1,10 @@
-# triune_takeoff_apply_buttons.py
+# triune_takeoff_apply_buttons_working.py
 # Triune Takeoff — Product & Per-product TAG editors use explicit "Apply" buttons.
-# - Global TAG ordering removed.
+# Updated fixes: robust AgGrid return mode, store original+normalized orders, rerun after apply, debug output.
 # Run:
 #   python -m pip install streamlit pandas openpyxl
-#   python -m pip install streamlit-aggrid   # optional
-#   streamlit run triune_takeoff_apply_buttons.py
+#   python -m pip install streamlit-aggrid   # recommended
+#   streamlit run triune_takeoff_apply_buttons_working.py
 
 import io
 import re
@@ -19,7 +19,7 @@ import streamlit as st
 
 # optional ag-grid
 try:
-    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, DataReturnMode as DRM, DataReturnMode
     HAS_AGGRID = True
 except Exception:
     HAS_AGGRID = False
@@ -31,7 +31,7 @@ from openpyxl.utils import get_column_letter
 # ---------------------------
 # App constants
 # ---------------------------
-APP_TITLE = "Triune Takeoff — Apply buttons for editors"
+APP_TITLE = "Triune Takeoff — Apply buttons for editors (robust)"
 
 TRIUNE_COLUMNS = [
     "PRODUCT", "BRAND", "MODEL", "QTY", "TAG",
@@ -400,18 +400,20 @@ def render_dragdrop_product_editor_managed(preview_df: pd.DataFrame):
             gridOptions["getRowNodeId"] = "function(data) { return data._row_id; }"
             gridOptions["suppressMovableColumns"] = True
 
+            # important: use AS_INPUT so the grid returns the exact user-ordered rows
             grid_response = AgGrid(
                 grid_df,
                 gridOptions=gridOptions,
                 height=min(480, 40 * len(grid_df) + 120),
                 allow_unsafe_jscode=True,
                 update_mode=GridUpdateMode.MODEL_CHANGED,
-                data_return_mode=DataReturnMode.FILTERED_AND_SORTED
+                data_return_mode=DataReturnMode.AS_INPUT
             )
 
             resp = None
             if isinstance(grid_response, dict):
-                resp = grid_response.get("data") or grid_response.get("selected_rows") or grid_response.get("gridData") or grid_response.get("rowData")
+                # support different return payload shapes
+                resp = grid_response.get("data") or grid_response.get("rowData") or grid_response.get("gridData") or grid_response.get("selected_rows") or grid_response.get("returnedData")
             else:
                 resp = grid_response
 
@@ -461,10 +463,9 @@ def render_dragdrop_product_editor_managed(preview_df: pd.DataFrame):
             if not rows:
                 rows = grid_df.to_dict("records")
         else:
-            # fallback textarea editable list
-            pasted = st.text_area("Manual product order (one product per line):", value="\n".join(products), height=200, key="manual_order_fallback")
-            lines = [ln.strip() for ln in pasted.splitlines() if ln.strip() != ""]
-            rows = [{"PRODUCT": ln, "INCLUDE": True} for ln in lines]
+            # fallback: show informational message instead of a newline-edit textarea
+            st.info("AG Grid not available — install streamlit-aggrid to enable drag-and-drop product ordering.")
+            rows = grid_df.to_dict("records")
 
         # Show current preview order (not saved yet)
         preview_order = [r.get("PRODUCT") for r in rows if (isinstance(r, dict) and bool(r.get("INCLUDE", True)))]
@@ -472,8 +473,9 @@ def render_dragdrop_product_editor_managed(preview_df: pd.DataFrame):
         st.write(preview_order)
 
         # Build manual_list normalized but do not save until Apply clicked
+        manual_list_orig = []
+        manual_list_norm = []
         seen2 = set()
-        manual_list = []
         for r in rows:
             if not isinstance(r, dict):
                 continue
@@ -489,22 +491,37 @@ def render_dragdrop_product_editor_managed(preview_df: pd.DataFrame):
             except Exception:
                 pass
             pnorm = normalize_product_text(prod_orig)
-            if pnorm not in seen2 and pnorm != "":
-                seen2.add(pnorm); manual_list.append(pnorm)
+            if pnorm != "" and pnorm not in seen2:
+                seen2.add(pnorm)
+                manual_list_norm.append(pnorm)
+                manual_list_orig.append(prod_orig)
 
         if st.button("Apply product order"):
-            if manual_list:
-                st.session_state['triune_manual_products'] = manual_list
+            if manual_list_norm:
+                # store both: normalized (for internal matching) and original (for display/debug)
+                st.session_state['triune_manual_products'] = manual_list_norm
+                st.session_state['triune_manual_products_original'] = manual_list_orig
                 st.session_state['product_grid_snapshot'] = rows
-                st.success(f"Product order applied — {len(manual_list)} products saved.")
+                st.success(f"Product order applied — {len(manual_list_norm)} products saved.")
+                # ensure pipeline uses the new state immediately
+                st.experimental_rerun()
             else:
-                if 'triune_manual_products' in st.session_state:
-                    del st.session_state['triune_manual_products']
+                st.session_state.pop('triune_manual_products', None)
+                st.session_state.pop('triune_manual_products_original', None)
                 st.info("Cleared manual product order (nothing saved).")
+
+        # debug display (temporary)
+        if st.session_state.get('triune_manual_products_original') or st.session_state.get('triune_manual_products'):
+            st.caption("**DEBUG: saved product order**")
+            st.write("Normalized saved order:", st.session_state.get('triune_manual_products'))
+            st.write("Original saved order:", st.session_state.get('triune_manual_products_original'))
+
 
 def render_per_product_tag_editor(preview_df: pd.DataFrame):
     """
     Shows per-product tag editor with explicit Apply button to save per-product tag order.
+    Fallback newline-separated textarea has been removed. If AG Grid is not available,
+    the editor will show an informational message and use the detected tag order as-is.
     """
     detected_products = preview_df["PRODUCT"].fillna("").astype(str).tolist()
     seen = set(); prod_list = []
@@ -570,11 +587,11 @@ def render_per_product_tag_editor(preview_df: pd.DataFrame):
             resp = AgGrid(grid_df, gridOptions=opts, height=min(360, 36*len(grid_df)+120),
                           allow_unsafe_jscode=True,
                           update_mode=GridUpdateMode.MODEL_CHANGED,
-                          data_return_mode=DataReturnMode.FILTERED_AND_SORTED)
+                          data_return_mode=DataReturnMode.AS_INPUT)
 
             resp_data = None
             if isinstance(resp, dict):
-                resp_data = resp.get("data") or resp.get("rowData") or resp.get("gridData") or resp.get("selected_rows")
+                resp_data = resp.get("data") or resp.get("rowData") or resp.get("gridData") or resp.get("selected_rows") or resp.get("returnedData")
             else:
                 resp_data = resp
 
@@ -590,9 +607,9 @@ def render_per_product_tag_editor(preview_df: pd.DataFrame):
             if not rows:
                 rows = grid_df.to_dict("records")
         else:
-            pasted = st.text_area("Manual tag order for this product (one tag per line):", value="\n".join(tags), height=180, key=f"manual_tag_order_{sel_prod_norm}")
-            lines = [ln.strip() for ln in pasted.splitlines() if ln.strip() != ""]
-            rows = [{"TAG": ln, "INCLUDE": True} for ln in lines]
+            # Removed the newline-separated textarea fallback — show info and keep original detected order
+            st.info("AG Grid not available — install streamlit-aggrid to enable drag-and-drop TAG ordering.")
+            rows = grid_df.to_dict("records")
 
         preview_order = [r.get("TAG") for r in rows if (isinstance(r, dict) and bool(r.get("INCLUDE", True)))]
         st.markdown("**Preview (unsaved) tag order for product:**")
@@ -600,6 +617,7 @@ def render_per_product_tag_editor(preview_df: pd.DataFrame):
 
         # build manual normalized list but do not save until Apply clicked
         manual_norm_list = []
+        manual_orig_list = []
         for r in rows:
             if not isinstance(r, dict): continue
             include = r.get("INCLUDE", r.get("include", True))
@@ -612,19 +630,32 @@ def render_per_product_tag_editor(preview_df: pd.DataFrame):
             tn = _norm_key(tval)
             if tn != "":
                 manual_norm_list.append(tn)
+                manual_orig_list.append(tval)
 
         if st.button(f"Apply TAG order for product: {sel_prod}"):
             if 'triune_manual_tags_by_product' not in st.session_state:
                 st.session_state['triune_manual_tags_by_product'] = {}
+            if 'triune_manual_tags_by_product_orig' not in st.session_state:
+                st.session_state['triune_manual_tags_by_product_orig'] = {}
             if manual_norm_list:
                 st.session_state['triune_manual_tags_by_product'][sel_prod_norm] = manual_norm_list
+                st.session_state['triune_manual_tags_by_product_orig'][sel_prod_norm] = manual_orig_list
                 st.session_state['triune_perprod_tag_snapshot'] = st.session_state['triune_manual_tags_by_product']
                 st.success(f"Saved manual TAG order for product: {sel_prod} ({len(manual_norm_list)} tags).")
+                st.experimental_rerun()
             else:
                 # clear per-product manual order if nothing provided
                 if sel_prod_norm in st.session_state.get('triune_manual_tags_by_product', {}):
                     del st.session_state['triune_manual_tags_by_product'][sel_prod_norm]
+                if sel_prod_norm in st.session_state.get('triune_manual_tags_by_product_orig', {}):
+                    del st.session_state['triune_manual_tags_by_product_orig'][sel_prod_norm]
                 st.info(f"Cleared manual TAG order for product: {sel_prod} (nothing saved).")
+
+        # debug display (temporary)
+        if st.session_state.get('triune_manual_tags_by_product'):
+            st.caption("**DEBUG: saved per-product tag orders (normalized keys)**")
+            st.write("Normalized (by product):", st.session_state.get('triune_manual_tags_by_product'))
+            st.write("Original (by product):", st.session_state.get('triune_manual_tags_by_product_orig'))
 
 # ---------------------------
 # Ordering helpers & pipeline (unchanged logic)
@@ -656,7 +687,11 @@ def reorder_grouped(grouped: pd.DataFrame,
         for orig, norm in zip(prod_series, prod_norms):
             if norm not in unique_prods_norm:
                 unique_prods_norm.append(norm); unique_prods.append(orig)
-        manual_in_df = [unique_prods[unique_prods_norm.index(m)] for m in manual_norm if m in unique_prods_norm]
+        # map normalized manual entries back to original strings that exist in the df
+        manual_in_df = []
+        for m in manual_norm:
+            if m in unique_prods_norm:
+                manual_in_df.append(unique_prods[unique_prods_norm.index(m)])
         if manual_in_df:
             remaining = [p for p in unique_prods if p not in manual_in_df]
             cat_order = manual_in_df + remaining
